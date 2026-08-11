@@ -517,6 +517,51 @@ func (c *Conn) Write(payload []byte) (int, error) {
 	})
 }
 
+// WritePackets writes application payloads as independent DTLS records.
+// Implementations of the underlying PacketConn may submit the resulting
+// datagrams as one synchronous batch.
+func (c *Conn) WritePackets(payloads [][]byte) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	if c.isConnectionClosed() {
+		return ErrConnClosed
+	}
+	select {
+	case <-c.writeDeadline.Done():
+		return errDeadlineExceeded
+	default:
+	}
+	if err := c.Handshake(); err != nil {
+		return err
+	}
+
+	ctx, cancel := c.contextWithClose(c.writeDeadline)
+	defer cancel()
+	packets := make([]*packet, len(payloads))
+	packetValues := make([]packet, len(payloads))
+	recordValues := make([]recordlayer.RecordLayer, len(payloads))
+	contentValues := make([]protocol.ApplicationData, len(payloads))
+	for index, payload := range payloads {
+		contentValues[index].Data = payload
+		recordValues[index] = recordlayer.RecordLayer{
+			Header:  recordlayer.Header{Epoch: c.state.getLocalEpoch(), Version: protocol.Version1_2},
+			Content: &contentValues[index],
+		}
+		packetValues[index] = packet{
+			record:        &recordValues[index],
+			shouldWrapCID: len(c.state.remoteConnectionID) > 0,
+			shouldEncrypt: true,
+		}
+		packets[index] = &packetValues[index]
+	}
+	return c.writePackets(ctx, packets)
+}
+
+type packetBatchWriter interface {
+	WritePacketBatchContext(ctx context.Context, packets [][]byte) error
+}
+
 // Close closes the connection.
 func (c *Conn) Close() error {
 	err := c.close(true) //nolint:contextcheck
@@ -571,6 +616,17 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 		return err
 	}
 
+	if len(compactedRawPackets) > 1 {
+		if batchWriter, loaded := c.nextConn.Conn().(packetBatchWriter); loaded {
+			if err = batchWriter.WritePacketBatchContext(ctx, compactedRawPackets); err != nil {
+				if errors.Is(err, context.Canceled) && c.isConnectionClosed() {
+					return ErrConnClosed
+				}
+				return netError(err)
+			}
+			return nil
+		}
+	}
 	for _, compactedRawPacket := range compactedRawPackets {
 		if _, err = c.nextConn.WriteToContext(ctx, compactedRawPacket, rAddr); err != nil {
 			if errors.Is(err, context.Canceled) && c.isConnectionClosed() {
@@ -716,14 +772,24 @@ func (c *Conn) compactRawPackets(rawPackets [][]byte) [][]byte {
 	currentCombinedRawPacket := make([]byte, 0)
 
 	for _, rawPacket := range rawPackets {
+		if len(rawPacket) >= c.maximumTransmissionUnit {
+			if len(currentCombinedRawPacket) > 0 {
+				combinedRawPackets = append(combinedRawPackets, currentCombinedRawPacket)
+				currentCombinedRawPacket = nil
+			}
+			combinedRawPackets = append(combinedRawPackets, rawPacket)
+			continue
+		}
 		if len(currentCombinedRawPacket) > 0 && len(currentCombinedRawPacket)+len(rawPacket) >= c.maximumTransmissionUnit {
 			combinedRawPackets = append(combinedRawPackets, currentCombinedRawPacket)
-			currentCombinedRawPacket = []byte{}
+			currentCombinedRawPacket = nil
 		}
 		currentCombinedRawPacket = append(currentCombinedRawPacket, rawPacket...)
 	}
 
-	combinedRawPackets = append(combinedRawPackets, currentCombinedRawPacket)
+	if len(currentCombinedRawPacket) > 0 {
+		combinedRawPackets = append(combinedRawPackets, currentCombinedRawPacket)
+	}
 
 	return combinedRawPackets
 }
