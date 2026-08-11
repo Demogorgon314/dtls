@@ -310,6 +310,7 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 			WithFlightInterval(2*time.Second),
 			WithMTU(1500),
 			WithReplayProtectionWindow(128),
+			WithDedicatedPacketConn(),
 		)
 		require.NoError(t, err)
 
@@ -317,6 +318,7 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 		require.Equal(t, 2*time.Second, config.FlightInterval)
 		require.Equal(t, 1500, config.MTU)
 		require.Equal(t, 128, config.ReplayProtectionWindow)
+		require.True(t, config.DedicatedPacketConn)
 	})
 
 	t.Run("ServerOptionsOverrideDefaults", func(t *testing.T) {

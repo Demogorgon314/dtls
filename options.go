@@ -75,6 +75,7 @@ type dtlsConfig struct { //nolint:dupl
 	insecureSkipVerifyHello       bool
 	connectionIDGenerator         func() []byte
 	paddingLengthGenerator        func(uint) uint
+	dedicatedPacketConn           bool
 	helloRandomBytesGenerator     func() [handshake.RandomBytesLength]byte
 	clientHelloMessageHook        func(handshake.MessageClientHello) handshake.Message
 	serverHelloMessageHook        func(handshake.MessageServerHello) handshake.Message
@@ -121,6 +122,7 @@ func (c *dtlsConfig) toConfig() *Config {
 		InsecureSkipVerifyHello:       c.insecureSkipVerifyHello,
 		ConnectionIDGenerator:         c.connectionIDGenerator,
 		PaddingLengthGenerator:        c.paddingLengthGenerator,
+		DedicatedPacketConn:           c.dedicatedPacketConn,
 		HelloRandomBytesGenerator:     c.helloRandomBytesGenerator,
 		ClientHelloMessageHook:        c.clientHelloMessageHook,
 		ServerHelloMessageHook:        c.serverHelloMessageHook,
@@ -210,6 +212,22 @@ type sharedOption func(*dtlsConfig) error
 
 func (o sharedOption) applyServer(c *dtlsConfig) error { return o(c) }
 func (o sharedOption) applyClient(c *dtlsConfig) error { return o(c) }
+
+// clientOnlyOption wraps an apply function for client-only options.
+type clientOnlyOption func(*dtlsConfig) error
+
+func (o clientOnlyOption) applyClient(c *dtlsConfig) error { return o(c) }
+
+// WithDedicatedPacketConn enables direct application-data writes. The caller
+// must guarantee that the PacketConn is owned exclusively by this DTLS
+// connection so write deadlines cannot affect another DTLS connection.
+func WithDedicatedPacketConn() ClientOption {
+	return clientOnlyOption(func(c *dtlsConfig) error {
+		c.dedicatedPacketConn = true
+
+		return nil
+	})
+}
 
 // WithCertificates sets the certificate chain to present to the other side of the connection.
 // For functional options, an explicitly empty slice is not allowed.

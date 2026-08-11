@@ -72,6 +72,8 @@ type Conn struct {
 
 	maximumTransmissionUnit int
 	paddingLengthGenerator  func(uint) uint
+	dedicatedPacketConn     bool
+	dedicatedWriteDeadline  sync.Mutex
 
 	handshakeCompletedSuccessfully atomic.Bool
 	handshakeMutex                 sync.Mutex
@@ -250,6 +252,7 @@ func createConn(
 		handshakeCache:          newHandshakeCache(),
 		maximumTransmissionUnit: mtu,
 		paddingLengthGenerator:  paddingLengthGenerator,
+		dedicatedPacketConn:     config.DedicatedPacketConn,
 
 		decrypted: make(chan any, applicationDataQueueCapacity),
 		log:       logger,
@@ -540,10 +543,7 @@ func (c *Conn) Write(payload []byte) (int, error) {
 		return 0, err
 	}
 
-	ctx, cancel := c.contextWithClose(c.writeDeadline)
-	defer cancel()
-
-	return len(payload), c.writePackets(ctx, []*packet{
+	packets := []*packet{
 		{
 			record: &recordlayer.RecordLayer{
 				Header: recordlayer.Header{
@@ -557,7 +557,15 @@ func (c *Conn) Write(payload []byte) (int, error) {
 			shouldWrapCID: len(c.state.remoteConnectionID) > 0,
 			shouldEncrypt: true,
 		},
-	})
+	}
+	if c.dedicatedPacketConn {
+		return len(payload), c.writeApplicationPackets(packets)
+	}
+
+	ctx, cancel := c.contextWithClose(c.writeDeadline)
+	defer cancel()
+
+	return len(payload), c.writePackets(ctx, packets)
 }
 
 // WritePackets writes application payloads as independent DTLS records and
@@ -656,6 +664,38 @@ func (c *Conn) RemoteSRTPMasterKeyIdentifier() ([]byte, bool) {
 
 func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 	return c.writePreparedPackets(ctx, pkts, true)
+}
+
+func (c *Conn) writeApplicationPackets(pkts []*packet) error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	if c.isConnectionClosed() {
+		return ErrConnClosed
+	}
+	select {
+	case <-c.writeDeadline.Done():
+		return errDeadlineExceeded
+	default:
+	}
+
+	rawPackets, remoteAddress, err := c.prepareRawPackets(pkts)
+	if err != nil {
+		return err
+	}
+	for _, rawPacket := range c.compactRawPackets(rawPackets) {
+		if _, err = c.nextConn.Conn().WriteTo(rawPacket, remoteAddress); err != nil {
+			if c.isConnectionClosed() {
+				return ErrConnClosed
+			}
+			select {
+			case <-c.writeDeadline.Done():
+				return errDeadlineExceeded
+			default:
+			}
+			return netError(err)
+		}
+	}
+	return nil
 }
 
 func (c *Conn) writePacketBatch(ctx context.Context, pkts []*packet) error {
@@ -1577,12 +1617,16 @@ func (c *Conn) close(byUser bool) error {
 		c.closed.Close()
 	}
 	c.closeLock.Unlock()
+	var interruptErr error
+	if !isClosed && c.dedicatedPacketConn {
+		interruptErr = c.interruptDedicatedWrite()
+	}
 
 	cancelHandshaker()
 	cancelHandshakeReader()
 
 	if closedByUser || isClosed {
-		return nil
+		return interruptErr
 	}
 
 	if c.isHandshakeCompletedSuccessfully() && byUser {
@@ -1591,7 +1635,21 @@ func (c *Conn) close(byUser bool) error {
 		_ = c.notify(context.Background(), alert.Warning, alert.CloseNotify)
 	}
 
-	return c.nextConn.Close()
+	return errors.Join(interruptErr, c.nextConn.Close())
+}
+
+func (c *Conn) interruptDedicatedWrite() error {
+	c.dedicatedWriteDeadline.Lock()
+	defer c.dedicatedWriteDeadline.Unlock()
+
+	packetConn := c.nextConn.Conn()
+	if err := packetConn.SetWriteDeadline(time.Unix(1, 0)); err != nil {
+		return errors.Join(err, packetConn.Close())
+	}
+	c.writeLock.Lock()
+	resetErr := packetConn.SetWriteDeadline(time.Time{})
+	c.writeLock.Unlock()
+	return resetErr
 }
 
 func (c *Conn) isConnectionClosed() bool {
@@ -1652,6 +1710,20 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline implements net.Conn.SetWriteDeadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
+	if c.dedicatedPacketConn {
+		c.dedicatedWriteDeadline.Lock()
+		defer c.dedicatedWriteDeadline.Unlock()
+		previousDeadline, hadPreviousDeadline := c.writeDeadline.Deadline()
+		c.writeDeadline.Set(t)
+		if err := c.nextConn.Conn().SetWriteDeadline(t); err != nil {
+			if !hadPreviousDeadline {
+				previousDeadline = time.Time{}
+			}
+			c.writeDeadline.Set(previousDeadline)
+			return err
+		}
+		return nil
+	}
 	c.writeDeadline.Set(t)
 	// Write deadline is also fully managed by this layer.
 	return nil

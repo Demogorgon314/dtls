@@ -208,6 +208,12 @@ type Config struct { //nolint:dupl
 	// https://datatracker.ietf.org/doc/html/rfc9146#section-4
 	PaddingLengthGenerator func(uint) uint
 
+	// DedicatedPacketConn enables direct application-data writes for a
+	// PacketConn that is owned exclusively by this DTLS connection. The caller
+	// must ensure write deadlines cannot affect another connection sharing the
+	// same PacketConn.
+	DedicatedPacketConn bool
+
 	// HelloRandomBytesGenerator generates custom client hello random bytes.
 	HelloRandomBytesGenerator func() [handshake.RandomBytesLength]byte
 
