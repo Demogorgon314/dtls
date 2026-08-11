@@ -147,8 +147,9 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 				serverReady <- serverResult{conn: server, err: serverErr}
 			}()
 			client, err := testClient(ctx, clientPacketConn, serverPacketConn.LocalAddr(), &Config{
-				InsecureSkipVerify: true,
-				CipherSuites:       []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+				InsecureSkipVerify:  true,
+				CipherSuites:        []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+				DedicatedPacketConn: true,
 			}, false)
 			if err != nil {
 				b.Fatal(err)
@@ -166,16 +167,23 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 
 			packet := newDTLSBenchmarkPacket(payloadSize)
 			writeDone := make(chan error, 1)
+			windowRead := make(chan struct{})
+			const maximumInFlightPackets = 64
 			b.ReportAllocs()
 			b.SetBytes(int64(payloadSize))
 			b.ResetTimer()
 			go func() {
-				for index := 0; index < b.N; index++ {
-					setDTLSBenchmarkPacketSequence(packet, uint64(index))
-					if _, writeErr := client.Write(packet); writeErr != nil {
-						writeDone <- fmt.Errorf("write record %d: %w", index, writeErr)
-						return
+				for base := 0; base < b.N; base += maximumInFlightPackets {
+					count := min(maximumInFlightPackets, b.N-base)
+					for offset := range count {
+						sequence := base + offset
+						setDTLSBenchmarkPacketSequence(packet, uint64(sequence))
+						if _, writeErr := client.Write(packet); writeErr != nil {
+							writeDone <- fmt.Errorf("write record %d: %w", sequence, writeErr)
+							return
+						}
 					}
+					<-windowRead
 				}
 				writeDone <- nil
 			}()
@@ -190,6 +198,9 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 				if err = validateDTLSBenchmarkPacket(readBuffer[:count], uint64(expected)); err != nil {
 					cancel()
 					b.Fatal(err)
+				}
+				if (expected+1)%maximumInFlightPackets == 0 || expected+1 == b.N {
+					windowRead <- struct{}{}
 				}
 			}
 			if err = <-writeDone; err != nil {
