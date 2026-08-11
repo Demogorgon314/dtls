@@ -20,11 +20,13 @@ import (
 
 type recordingPacketBatchConn struct {
 	net.PacketConn
-	batchWrites atomic.Int32
+	batchWrites  atomic.Int32
+	batchPackets atomic.Int32
 }
 
 func (c *recordingPacketBatchConn) WritePacketBatchContext(ctx context.Context, packets [][]byte) error {
 	c.batchWrites.Add(1)
+	c.batchPackets.Add(int32(len(packets)))
 	for _, packet := range packets {
 		select {
 		case <-ctx.Done():
@@ -79,13 +81,15 @@ func TestWritePacketsUsesPacketBatchWriter(t *testing.T) {
 	}()
 
 	clientPacketConn.batchWrites.Store(0)
+	clientPacketConn.batchPackets.Store(0)
 	payloads := [][]byte{
-		bytes.Repeat([]byte{1}, 1400),
-		bytes.Repeat([]byte{2}, 1400),
-		bytes.Repeat([]byte{3}, 1400),
+		bytes.Repeat([]byte{1}, 64),
+		bytes.Repeat([]byte{2}, 64),
+		bytes.Repeat([]byte{3}, 64),
 	}
 	require.NoError(t, client.WritePackets(payloads))
 	require.Equal(t, int32(1), clientPacketConn.batchWrites.Load())
+	require.Equal(t, int32(len(payloads)), clientPacketConn.batchPackets.Load())
 
 	readBuffer := make([]byte, 1600)
 	for _, payload := range payloads {

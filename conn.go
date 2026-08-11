@@ -517,9 +517,9 @@ func (c *Conn) Write(payload []byte) (int, error) {
 	})
 }
 
-// WritePackets writes application payloads as independent DTLS records.
-// Implementations of the underlying PacketConn may submit the resulting
-// datagrams as one synchronous batch.
+// WritePackets writes application payloads as independent DTLS records and
+// preserves one UDP datagram per payload. Implementations of the underlying
+// PacketConn may submit those datagrams as one synchronous batch.
 func (c *Conn) WritePackets(payloads [][]byte) error {
 	if len(payloads) == 0 {
 		return nil
@@ -555,7 +555,7 @@ func (c *Conn) WritePackets(payloads [][]byte) error {
 		}
 		packets[index] = &packetValues[index]
 	}
-	return c.writePackets(ctx, packets)
+	return c.writePacketBatch(ctx, packets)
 }
 
 type packetBatchWriter interface {
@@ -608,17 +608,28 @@ func (c *Conn) RemoteSRTPMasterKeyIdentifier() ([]byte, bool) {
 }
 
 func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
+	return c.writePreparedPackets(ctx, pkts, true)
+}
+
+func (c *Conn) writePacketBatch(ctx context.Context, pkts []*packet) error {
+	return c.writePreparedPackets(ctx, pkts, false)
+}
+
+func (c *Conn) writePreparedPackets(ctx context.Context, pkts []*packet, compactRecords bool) error {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
 
-	compactedRawPackets, rAddr, err := c.prepareRawPackets(pkts)
+	rawPackets, rAddr, err := c.prepareRawPackets(pkts)
 	if err != nil {
 		return err
 	}
+	if compactRecords {
+		rawPackets = c.compactRawPackets(rawPackets)
+	}
 
-	if len(compactedRawPackets) > 1 {
+	if len(rawPackets) > 1 {
 		if batchWriter, loaded := c.nextConn.Conn().(packetBatchWriter); loaded {
-			if err = batchWriter.WritePacketBatchContext(ctx, compactedRawPackets); err != nil {
+			if err = batchWriter.WritePacketBatchContext(ctx, rawPackets); err != nil {
 				if errors.Is(err, context.Canceled) && c.isConnectionClosed() {
 					return ErrConnClosed
 				}
@@ -627,8 +638,8 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 			return nil
 		}
 	}
-	for _, compactedRawPacket := range compactedRawPackets {
-		if _, err = c.nextConn.WriteToContext(ctx, compactedRawPacket, rAddr); err != nil {
+	for _, rawPacket := range rawPackets {
+		if _, err = c.nextConn.WriteToContext(ctx, rawPacket, rAddr); err != nil {
 			if errors.Is(err, context.Canceled) && c.isConnectionClosed() {
 				return ErrConnClosed
 			}
@@ -658,7 +669,7 @@ func (c *Conn) prepareRawPackets(pkts []*packet) ([][]byte, net.Addr, error) {
 		return nil, nil, nil
 	}
 
-	return c.compactRawPackets(rawPackets), c.rAddr, nil
+	return rawPackets, c.rAddr, nil
 }
 
 func (c *Conn) prepareRawPacket(pkt *packet) ([][]byte, error) {
