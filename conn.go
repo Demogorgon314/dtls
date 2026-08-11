@@ -29,10 +29,11 @@ import (
 )
 
 const (
-	initialTickerInterval = time.Second
-	cookieLength          = 20
-	sessionLength         = 32
-	inboundBufferSize     = 8192
+	initialTickerInterval        = time.Second
+	cookieLength                 = 20
+	sessionLength                = 32
+	inboundBufferSize            = 8192
+	applicationDataQueueCapacity = 64
 	// Default replay protection window is specified by RFC 6347 Section 4.1.2.6.
 	defaultReplayProtectionWindow = 64
 	// maxAppDataPacketQueueSize is the maximum number of app data packets we will.
@@ -250,7 +251,7 @@ func createConn(
 		maximumTransmissionUnit: mtu,
 		paddingLengthGenerator:  paddingLengthGenerator,
 
-		decrypted: make(chan any, 1),
+		decrypted: make(chan any, applicationDataQueueCapacity),
 		log:       logger,
 
 		readDeadline:  deadline.New(),
@@ -481,6 +482,48 @@ func (c *Conn) Read(buff []byte) (n int, err error) { //nolint:cyclop
 	}
 }
 
+// ReadPackets returns the next application-data packet and any additional
+// packets already available. Ownership of the returned packet slices is
+// transferred to the caller.
+func (c *Conn) ReadPackets() (packets [][]byte, err error) {
+	if err = c.Handshake(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.readDeadline.Done():
+		return nil, errDeadlineExceeded
+	default:
+	}
+	for {
+		var out any
+		var loaded bool
+		if len(packets) == 0 {
+			select {
+			case <-c.closed.Done():
+				return nil, io.EOF
+			case <-c.readDeadline.Done():
+				return nil, errDeadlineExceeded
+			case out, loaded = <-c.decrypted:
+			}
+		} else {
+			select {
+			case out, loaded = <-c.decrypted:
+			default:
+				return packets, nil
+			}
+		}
+		if !loaded {
+			return packets, io.EOF
+		}
+		switch value := out.(type) {
+		case []byte:
+			packets = append(packets, value)
+		case error:
+			return packets, value
+		}
+	}
+}
+
 // Write writes len(payload) bytes from payload to the DTLS connection.
 func (c *Conn) Write(payload []byte) (int, error) {
 	if c.isConnectionClosed() {
@@ -560,6 +603,10 @@ func (c *Conn) WritePackets(payloads [][]byte) error {
 
 type packetBatchWriter interface {
 	WritePacketBatchContext(ctx context.Context, packets [][]byte) error
+}
+
+type packetBatchReader interface {
+	ReadPacketBatchContext(ctx context.Context) (packets [][]byte, remoteAddress net.Addr, release func(), err error)
 }
 
 // Close closes the connection.
@@ -996,6 +1043,25 @@ var poolReadBuffer = sync.Pool{ //nolint:gochecknoglobals
 }
 
 func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
+	if batchReader, loaded := c.nextConn.Conn().(packetBatchReader); loaded {
+		datagrams, remoteAddress, release, err := batchReader.ReadPacketBatchContext(ctx)
+		if release != nil {
+			defer release()
+		}
+		if err != nil {
+			return netError(err)
+		}
+		if len(datagrams) == 0 {
+			return errEmptyPacketBatch
+		}
+		for _, datagram := range datagrams {
+			if err = c.handleIncomingDatagram(ctx, datagram, remoteAddress); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	bufptr, ok := poolReadBuffer.Get().(*[]byte)
 	if !ok {
 		return errFailedToAccessPoolReadBuffer
@@ -1007,15 +1073,18 @@ func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
 	if err != nil {
 		return netError(err)
 	}
+	return c.handleIncomingDatagram(ctx, b[:i], rAddr)
+}
 
-	pkts, err := recordlayer.ContentAwareUnpackDatagram(b[:i], len(c.state.getLocalConnectionID()))
+func (c *Conn) handleIncomingDatagram(ctx context.Context, datagram []byte, remoteAddress net.Addr) error {
+	pkts, err := recordlayer.ContentAwareUnpackDatagram(datagram, len(c.state.getLocalConnectionID()))
 	if err != nil {
 		return err
 	}
 
 	var hasHandshake, isRetransmit bool
 	for _, p := range pkts {
-		hs, rtx, alert, err := c.handleIncomingPacket(ctx, p, rAddr, true)
+		hs, rtx, alert, err := c.handleIncomingPacket(ctx, p, remoteAddress, true)
 		if alert != nil {
 			if alertErr := c.notify(ctx, alert.Level, alert.Description); alertErr != nil {
 				if err == nil {

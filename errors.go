@@ -20,6 +20,7 @@ var (
 	ErrConnClosed = &FatalError{Err: errors.New("conn is closed")} //nolint:err113
 
 	errDeadlineExceeded   = &TimeoutError{Err: fmt.Errorf("read/write timeout: %w", context.DeadlineExceeded)}
+	errEmptyPacketBatch   = &TemporaryError{Err: errors.New("packet batch reader returned no packets")}
 	errInvalidContentType = &TemporaryError{Err: errors.New("invalid content type")} //nolint:err113
 
 	//nolint:err113
