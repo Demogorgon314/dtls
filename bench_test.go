@@ -5,6 +5,8 @@ package dtls
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -121,6 +123,7 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 		id   CipherSuiteID
 		psk  bool
 	}{
+		{name: "AES256-GCM", id: TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
 		{name: "AES128-GCM", id: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		{name: "PSK-ChaCha20-Poly1305", id: TLS_PSK_WITH_CHACHA20_POLY1305_SHA256, psk: true},
 	} {
@@ -352,7 +355,17 @@ func benchmarkAnyConnectP2DTLSUDP(b *testing.B, cipherSuite CipherSuiteID, usePS
 				clientConfig.PSK = pskCallback
 				clientConfig.PSKIdentityHint = []byte("anyconnect-benchmark")
 			} else {
-				certificate, generateErr := selfsign.GenerateSelfSigned()
+				var certificate tls.Certificate
+				var generateErr error
+				if cipherSuite == TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 {
+					privateKey, keyErr := rsa.GenerateKey(rand.Reader, 2048)
+					if keyErr != nil {
+						b.Fatal(keyErr)
+					}
+					certificate, generateErr = selfsign.SelfSign(privateKey)
+				} else {
+					certificate, generateErr = selfsign.GenerateSelfSigned()
+				}
 				if generateErr != nil {
 					b.Fatal(generateErr)
 				}
