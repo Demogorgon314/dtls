@@ -74,10 +74,11 @@ type Conn struct {
 	rAddr          net.Addr
 	state          State // Internal state
 
-	maximumTransmissionUnit int
-	paddingLengthGenerator  func(uint) uint
-	dedicatedPacketConn     bool
-	dedicatedWriteDeadline  sync.Mutex
+	maximumTransmissionUnit        int
+	paddingLengthGenerator         func(uint) uint
+	dedicatedPacketConn            bool
+	applicationDataBufferAllocator ApplicationDataBufferAllocator
+	dedicatedWriteDeadline         sync.Mutex
 
 	handshakeCompletedSuccessfully atomic.Bool
 	handshakeMutex                 sync.Mutex
@@ -249,14 +250,15 @@ func createConn(
 	}
 
 	conn := &Conn{
-		rAddr:                   rAddr,
-		nextConn:                netctx.NewPacketConn(nextConn),
-		handshakeConfig:         handshakeConfig,
-		fragmentBuffer:          newFragmentBuffer(),
-		handshakeCache:          newHandshakeCache(),
-		maximumTransmissionUnit: mtu,
-		paddingLengthGenerator:  paddingLengthGenerator,
-		dedicatedPacketConn:     config.DedicatedPacketConn,
+		rAddr:                          rAddr,
+		nextConn:                       netctx.NewPacketConn(nextConn),
+		handshakeConfig:                handshakeConfig,
+		fragmentBuffer:                 newFragmentBuffer(),
+		handshakeCache:                 newHandshakeCache(),
+		maximumTransmissionUnit:        mtu,
+		paddingLengthGenerator:         paddingLengthGenerator,
+		dedicatedPacketConn:            config.DedicatedPacketConn,
+		applicationDataBufferAllocator: config.ApplicationDataBufferAllocator,
 
 		decrypted: make(chan any, applicationDataQueueCapacity),
 		log:       logger,
@@ -482,6 +484,15 @@ func (c *Conn) Read(buff []byte) (n int, err error) { //nolint:cyclop
 				copy(buff, val)
 
 				return len(val), nil
+			case ApplicationDataBuffer:
+				data := val.Bytes()
+				defer val.Release()
+				if len(buff) < len(data) {
+					return 0, errBufferTooSmall
+				}
+				copy(buff, data)
+
+				return len(data), nil
 			case (error):
 				return 0, val
 			}
@@ -525,8 +536,60 @@ func (c *Conn) ReadPackets() (packets [][]byte, err error) {
 		switch value := out.(type) {
 		case []byte:
 			packets = append(packets, value)
+		case ApplicationDataBuffer:
+			packets = append(packets, append([]byte(nil), value.Bytes()...))
+			value.Release()
 		case error:
 			return packets, value
+		}
+	}
+}
+
+type heapApplicationDataBuffer []byte
+
+func (b heapApplicationDataBuffer) Bytes() []byte { return b }
+func (heapApplicationDataBuffer) Release()        {}
+
+// ReadApplicationDataBuffers returns the next application-data buffer and any
+// additional buffers already available. The caller must release every buffer,
+// including buffers returned alongside an error.
+func (c *Conn) ReadApplicationDataBuffers() (buffers []ApplicationDataBuffer, err error) {
+	if err = c.Handshake(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.readDeadline.Done():
+		return nil, errDeadlineExceeded
+	default:
+	}
+	for {
+		var out any
+		var loaded bool
+		if len(buffers) == 0 {
+			select {
+			case <-c.closed.Done():
+				return nil, io.EOF
+			case <-c.readDeadline.Done():
+				return nil, errDeadlineExceeded
+			case out, loaded = <-c.decrypted:
+			}
+		} else {
+			select {
+			case out, loaded = <-c.decrypted:
+			default:
+				return buffers, nil
+			}
+		}
+		if !loaded {
+			return buffers, io.EOF
+		}
+		switch value := out.(type) {
+		case []byte:
+			buffers = append(buffers, heapApplicationDataBuffer(value))
+		case ApplicationDataBuffer:
+			buffers = append(buffers, value)
+		case error:
+			return buffers, value
 		}
 	}
 }
@@ -1362,6 +1425,38 @@ func (c *Conn) handleIncomingPacket(
 			return true, isRetransmit, nil, nil
 		}
 	}
+	if header.ContentType == protocol.ContentTypeApplicationData && c.applicationDataBufferAllocator != nil {
+		if header.Epoch == 0 {
+			return false, false, &alert.Alert{
+				Level: alert.Fatal, Description: alert.UnexpectedMessage,
+			}, errApplicationDataEpochZero
+		}
+		headerSize := header.Size()
+		if len(buf) < headerSize {
+			return false, false, &alert.Alert{Level: alert.Fatal, Description: alert.DecodeError},
+				errInvalidApplicationDataBuffer
+		}
+		payload := buf[headerSize:]
+		applicationBuffer := c.applicationDataBufferAllocator(len(payload))
+		if applicationBuffer == nil || len(applicationBuffer.Bytes()) != len(payload) {
+			if applicationBuffer != nil {
+				applicationBuffer.Release()
+			}
+			return false, false, &alert.Alert{Level: alert.Fatal, Description: alert.InternalError},
+				errInvalidApplicationDataBuffer
+		}
+		copy(applicationBuffer.Bytes(), payload)
+		markPacketAsValid()
+		select {
+		case c.decrypted <- applicationBuffer:
+		case <-c.closed.Done():
+			applicationBuffer.Release()
+		case <-ctx.Done():
+			applicationBuffer.Release()
+		}
+
+		return false, false, nil, nil
+	}
 
 	r := &recordlayer.RecordLayer{}
 	if err := r.Unmarshal(buf); err != nil {
@@ -1522,6 +1617,11 @@ func (c *Conn) handshake(
 				// Escaping read loop.
 				// It's safe to close decrypted channnel now.
 				close(c.decrypted)
+				for value := range c.decrypted {
+					if buffer, ok := value.(ApplicationDataBuffer); ok {
+						buffer.Release()
+					}
+				}
 			}
 
 			// Force stop handshaker when the underlying connection is closed.

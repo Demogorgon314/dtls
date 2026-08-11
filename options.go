@@ -43,47 +43,48 @@ func defensiveCopy[T any](t ...T) []T {
 // dtlsConfig is the internal configuration structure.
 // This will eventually replace the exported Config struct.
 type dtlsConfig struct { //nolint:dupl
-	certificates                  []tls.Certificate
-	cipherSuites                  []CipherSuiteID
-	customCipherSuites            func() []CipherSuite
-	signatureSchemes              []tls.SignatureScheme
-	certificateSignatureSchemes   []tls.SignatureScheme
-	srtpProtectionProfiles        []SRTPProtectionProfile
-	srtpMasterKeyIdentifier       []byte
-	clientAuth                    ClientAuthType
-	extendedMasterSecret          ExtendedMasterSecretType
-	flightInterval                time.Duration
-	disableRetransmitBackoff      bool
-	psk                           PSKCallback
-	pskIdentityHint               []byte
-	insecureSkipVerify            bool
-	insecureHashes                bool
-	verifyPeerCertificate         func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
-	verifyConnection              func(*State) error
-	rootCAs                       *x509.CertPool
-	clientCAs                     *x509.CertPool
-	serverName                    string
-	loggerFactory                 logging.LoggerFactory
-	mtu                           int
-	replayProtectionWindow        int
-	keyLogWriter                  io.Writer
-	sessionStore                  SessionStore
-	supportedProtocols            []string
-	ellipticCurves                []elliptic.Curve
-	getCertificate                func(*ClientHelloInfo) (*tls.Certificate, error)
-	getClientCertificate          func(*CertificateRequestInfo) (*tls.Certificate, error)
-	insecureSkipVerifyHello       bool
-	connectionIDGenerator         func() []byte
-	paddingLengthGenerator        func(uint) uint
-	dedicatedPacketConn           bool
-	helloRandomBytesGenerator     func() [handshake.RandomBytesLength]byte
-	clientHelloMessageHook        func(handshake.MessageClientHello) handshake.Message
-	serverHelloMessageHook        func(handshake.MessageServerHello) handshake.Message
-	certificateRequestMessageHook func(handshake.MessageCertificateRequest) handshake.Message
-	onConnectionAttempt           func(net.Addr) error
-	listenConfig                  net.ListenConfig
-	minVersion                    protocol.Version
-	maxVersion                    protocol.Version
+	certificates                   []tls.Certificate
+	cipherSuites                   []CipherSuiteID
+	customCipherSuites             func() []CipherSuite
+	signatureSchemes               []tls.SignatureScheme
+	certificateSignatureSchemes    []tls.SignatureScheme
+	srtpProtectionProfiles         []SRTPProtectionProfile
+	srtpMasterKeyIdentifier        []byte
+	clientAuth                     ClientAuthType
+	extendedMasterSecret           ExtendedMasterSecretType
+	flightInterval                 time.Duration
+	disableRetransmitBackoff       bool
+	psk                            PSKCallback
+	pskIdentityHint                []byte
+	insecureSkipVerify             bool
+	insecureHashes                 bool
+	verifyPeerCertificate          func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
+	verifyConnection               func(*State) error
+	rootCAs                        *x509.CertPool
+	clientCAs                      *x509.CertPool
+	serverName                     string
+	loggerFactory                  logging.LoggerFactory
+	mtu                            int
+	replayProtectionWindow         int
+	keyLogWriter                   io.Writer
+	sessionStore                   SessionStore
+	supportedProtocols             []string
+	ellipticCurves                 []elliptic.Curve
+	getCertificate                 func(*ClientHelloInfo) (*tls.Certificate, error)
+	getClientCertificate           func(*CertificateRequestInfo) (*tls.Certificate, error)
+	insecureSkipVerifyHello        bool
+	connectionIDGenerator          func() []byte
+	paddingLengthGenerator         func(uint) uint
+	dedicatedPacketConn            bool
+	applicationDataBufferAllocator ApplicationDataBufferAllocator
+	helloRandomBytesGenerator      func() [handshake.RandomBytesLength]byte
+	clientHelloMessageHook         func(handshake.MessageClientHello) handshake.Message
+	serverHelloMessageHook         func(handshake.MessageServerHello) handshake.Message
+	certificateRequestMessageHook  func(handshake.MessageCertificateRequest) handshake.Message
+	onConnectionAttempt            func(net.Addr) error
+	listenConfig                   net.ListenConfig
+	minVersion                     protocol.Version
+	maxVersion                     protocol.Version
 }
 
 // applyDefaults applies default values to the config.
@@ -99,38 +100,39 @@ func (c *dtlsConfig) applyDefaults() {
 // All slice fields are copied to ensure immutability.
 func (c *dtlsConfig) toConfig() *Config {
 	config := &Config{
-		CustomCipherSuites:            c.customCipherSuites,
-		ClientAuth:                    c.clientAuth,
-		ExtendedMasterSecret:          c.extendedMasterSecret,
-		FlightInterval:                c.flightInterval,
-		DisableRetransmitBackoff:      c.disableRetransmitBackoff,
-		PSK:                           c.psk,
-		InsecureSkipVerify:            c.insecureSkipVerify,
-		InsecureHashes:                c.insecureHashes,
-		VerifyPeerCertificate:         c.verifyPeerCertificate,
-		VerifyConnection:              c.verifyConnection,
-		RootCAs:                       c.rootCAs,
-		ClientCAs:                     c.clientCAs,
-		ServerName:                    c.serverName,
-		LoggerFactory:                 c.loggerFactory,
-		MTU:                           c.mtu,
-		ReplayProtectionWindow:        c.replayProtectionWindow,
-		KeyLogWriter:                  c.keyLogWriter,
-		SessionStore:                  c.sessionStore,
-		GetCertificate:                c.getCertificate,
-		GetClientCertificate:          c.getClientCertificate,
-		InsecureSkipVerifyHello:       c.insecureSkipVerifyHello,
-		ConnectionIDGenerator:         c.connectionIDGenerator,
-		PaddingLengthGenerator:        c.paddingLengthGenerator,
-		DedicatedPacketConn:           c.dedicatedPacketConn,
-		HelloRandomBytesGenerator:     c.helloRandomBytesGenerator,
-		ClientHelloMessageHook:        c.clientHelloMessageHook,
-		ServerHelloMessageHook:        c.serverHelloMessageHook,
-		CertificateRequestMessageHook: c.certificateRequestMessageHook,
-		OnConnectionAttempt:           c.onConnectionAttempt,
-		listenConfig:                  c.listenConfig,
-		minVersion:                    c.minVersion,
-		maxVersion:                    c.maxVersion,
+		CustomCipherSuites:             c.customCipherSuites,
+		ClientAuth:                     c.clientAuth,
+		ExtendedMasterSecret:           c.extendedMasterSecret,
+		FlightInterval:                 c.flightInterval,
+		DisableRetransmitBackoff:       c.disableRetransmitBackoff,
+		PSK:                            c.psk,
+		InsecureSkipVerify:             c.insecureSkipVerify,
+		InsecureHashes:                 c.insecureHashes,
+		VerifyPeerCertificate:          c.verifyPeerCertificate,
+		VerifyConnection:               c.verifyConnection,
+		RootCAs:                        c.rootCAs,
+		ClientCAs:                      c.clientCAs,
+		ServerName:                     c.serverName,
+		LoggerFactory:                  c.loggerFactory,
+		MTU:                            c.mtu,
+		ReplayProtectionWindow:         c.replayProtectionWindow,
+		KeyLogWriter:                   c.keyLogWriter,
+		SessionStore:                   c.sessionStore,
+		GetCertificate:                 c.getCertificate,
+		GetClientCertificate:           c.getClientCertificate,
+		InsecureSkipVerifyHello:        c.insecureSkipVerifyHello,
+		ConnectionIDGenerator:          c.connectionIDGenerator,
+		PaddingLengthGenerator:         c.paddingLengthGenerator,
+		DedicatedPacketConn:            c.dedicatedPacketConn,
+		ApplicationDataBufferAllocator: c.applicationDataBufferAllocator,
+		HelloRandomBytesGenerator:      c.helloRandomBytesGenerator,
+		ClientHelloMessageHook:         c.clientHelloMessageHook,
+		ServerHelloMessageHook:         c.serverHelloMessageHook,
+		CertificateRequestMessageHook:  c.certificateRequestMessageHook,
+		OnConnectionAttempt:            c.onConnectionAttempt,
+		listenConfig:                   c.listenConfig,
+		minVersion:                     c.minVersion,
+		maxVersion:                     c.maxVersion,
 	}
 
 	if len(c.certificates) > 0 {
@@ -553,6 +555,19 @@ func WithPaddingLengthGenerator(fn func(uint) uint) Option {
 			return errNilPaddingLengthGenerator
 		}
 		c.paddingLengthGenerator = fn
+
+		return nil
+	})
+}
+
+// WithApplicationDataBufferAllocator supplies reusable receive buffers for
+// ReadApplicationDataBuffers.
+func WithApplicationDataBufferAllocator(fn ApplicationDataBufferAllocator) Option {
+	return sharedOption(func(c *dtlsConfig) error {
+		if fn == nil {
+			return errNilApplicationDataBufferAllocator
+		}
+		c.applicationDataBufferAllocator = fn
 
 		return nil
 	})

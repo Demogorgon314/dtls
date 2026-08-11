@@ -22,6 +22,16 @@ import (
 
 const keyLogLabelTLS12 = "CLIENT_RANDOM"
 
+// ApplicationDataBuffer owns writable storage for one application-data
+// packet. Bytes must retain a stable length and backing array until Release.
+type ApplicationDataBuffer interface {
+	Bytes() []byte
+	Release()
+}
+
+// ApplicationDataBufferAllocator allocates caller-owned packet storage.
+type ApplicationDataBufferAllocator func(size int) ApplicationDataBuffer
+
 // Config is used to configure a DTLS client or server.
 // After a Config is passed to a DTLS function it must not be modified.
 //
@@ -213,6 +223,10 @@ type Config struct { //nolint:dupl
 	// must ensure write deadlines cannot affect another connection sharing the
 	// same PacketConn.
 	DedicatedPacketConn bool
+
+	// ApplicationDataBufferAllocator optionally supplies reusable receive
+	// buffers. Use ReadApplicationDataBuffers to transfer their ownership.
+	ApplicationDataBufferAllocator ApplicationDataBufferAllocator
 
 	// HelloRandomBytesGenerator generates custom client hello random bytes.
 	HelloRandomBytesGenerator func() [handshake.RandomBytesLength]byte

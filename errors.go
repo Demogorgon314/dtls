@@ -195,6 +195,14 @@ var (
 		Err: errors.New("padding length generator option requires a non-nil function"),
 	}
 	//nolint:err113
+	errNilApplicationDataBufferAllocator = &FatalError{
+		Err: errors.New("application data buffer allocator option requires a non-nil function"),
+	}
+	//nolint:err113
+	errInvalidApplicationDataBuffer = &InternalError{
+		Err: errors.New("application data buffer allocator returned invalid storage"),
+	}
+	//nolint:err113
 	errNilHelloRandomBytesGenerator = &FatalError{
 		Err: errors.New("hello random bytes generator option requires a non-nil function"),
 	}

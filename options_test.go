@@ -180,6 +180,14 @@ func TestNilCallbackOptionsReturnError(t *testing.T) {
 		require.ErrorIs(t, err, errNilPaddingLengthGenerator)
 	})
 
+	t.Run("NilApplicationDataBufferAllocator", func(t *testing.T) {
+		_, err := buildClientConfig(WithApplicationDataBufferAllocator(nil))
+		require.ErrorIs(t, err, errNilApplicationDataBufferAllocator)
+
+		_, err = buildServerConfig(WithApplicationDataBufferAllocator(nil))
+		require.ErrorIs(t, err, errNilApplicationDataBufferAllocator)
+	})
+
 	t.Run("NilHelloRandomBytesGenerator", func(t *testing.T) {
 		_, err := buildClientConfig(WithHelloRandomBytesGenerator(nil))
 		require.ErrorIs(t, err, errNilHelloRandomBytesGenerator)

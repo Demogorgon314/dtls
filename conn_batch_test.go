@@ -34,6 +34,18 @@ type recordingPacketBatchReadConn struct {
 	batchReleased chan struct{}
 }
 
+type trackingApplicationDataBuffer struct {
+	data     []byte
+	releases *atomic.Int32
+}
+
+func (b *trackingApplicationDataBuffer) Bytes() []byte { return b.data }
+
+func (b *trackingApplicationDataBuffer) Release() {
+	clear(b.data)
+	b.releases.Add(1)
+}
+
 func (c *recordingPacketBatchReadConn) ReadPacketBatchContext(ctx context.Context) ([][]byte, net.Addr, func(), error) {
 	readPacket := func() ([]byte, net.Addr, error) {
 		select {
@@ -167,12 +179,21 @@ func TestReadUsesPacketBatchReader(t *testing.T) {
 	}
 	certificate, err := selfsign.GenerateSelfSigned()
 	require.NoError(t, err)
+	var applicationBufferAllocations atomic.Int32
+	var applicationBufferReleases atomic.Int32
 
 	serverReady := make(chan *Conn, 1)
 	serverErr := make(chan error, 1)
 	go func() {
 		server, serveErr := testServer(ctx, serverPacketConn, serverTransport.RemoteAddr(), &Config{
 			Certificates: []tls.Certificate{certificate},
+			ApplicationDataBufferAllocator: func(size int) ApplicationDataBuffer {
+				applicationBufferAllocations.Add(1)
+				return &trackingApplicationDataBuffer{
+					data:     make([]byte, size),
+					releases: &applicationBufferReleases,
+				}
+			},
 		}, false)
 		if serveErr != nil {
 			serverErr <- serveErr
@@ -212,16 +233,39 @@ func TestReadUsesPacketBatchReader(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	received, readErr := server.ReadPackets()
+	receivedBuffers, readErr := server.ReadApplicationDataBuffers()
 	require.NoError(t, readErr)
-	require.Equal(t, payloads, received)
+	require.Len(t, receivedBuffers, len(payloads))
+	for index, receivedBuffer := range receivedBuffers {
+		require.Equal(t, payloads[index], receivedBuffer.Bytes())
+		receivedBuffer.Release()
+	}
+	require.Equal(t, int32(len(payloads)), applicationBufferReleases.Load())
 	require.Equal(t, int32(1), serverPacketConn.batchReads.Load())
 	require.Equal(t, int32(len(payloads)), serverPacketConn.batchPackets.Load())
 	require.Equal(t, int32(1), serverPacketConn.releases.Load())
+
+	serverPacketConn.enabled.Store(false)
+	_, err = client.Write(payloads[0])
+	require.NoError(t, err)
+	received, readErr := server.ReadPackets()
+	require.NoError(t, readErr)
+	require.Equal(t, payloads[:1], received)
+	require.Equal(t, int32(len(payloads)+1), applicationBufferReleases.Load())
 
 	require.NoError(t, server.SetReadDeadline(time.Now()))
 	received, readErr = server.ReadPackets()
 	require.Nil(t, received)
 	require.ErrorIs(t, readErr, errDeadlineExceeded)
 	require.NoError(t, server.SetReadDeadline(time.Time{}))
+
+	_, err = client.Write(payloads[0])
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return applicationBufferAllocations.Load() == int32(len(payloads)+2)
+	}, time.Second, time.Millisecond)
+	require.NoError(t, server.Close())
+	require.Eventually(t, func() bool {
+		return applicationBufferReleases.Load() == applicationBufferAllocations.Load()
+	}, time.Second, time.Millisecond)
 }
