@@ -14,6 +14,8 @@ import (
 
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	dtlsnet "github.com/pion/dtls/v3/pkg/net"
+	"github.com/pion/dtls/v3/pkg/protocol"
+	"github.com/pion/dtls/v3/pkg/protocol/recordlayer"
 	"github.com/pion/logging"
 	"github.com/pion/transport/v4/dpipe"
 	"github.com/pion/transport/v4/test"
@@ -114,6 +116,113 @@ func BenchmarkConnReadWrite(b *testing.B) {
 // connected-UDP write path used by AnyConnect. Every record carries a sequence
 // and payload canary that the peer validates before the iteration completes.
 func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
+	for _, cipherSuite := range []struct {
+		name string
+		id   CipherSuiteID
+		psk  bool
+	}{
+		{name: "AES128-GCM", id: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		{name: "PSK-ChaCha20-Poly1305", id: TLS_PSK_WITH_CHACHA20_POLY1305_SHA256, psk: true},
+	} {
+		b.Run(cipherSuite.name, func(b *testing.B) {
+			benchmarkAnyConnectP2DTLSUDP(b, cipherSuite.id, cipherSuite.psk)
+		})
+	}
+}
+
+// BenchmarkAnyConnectRecordProtection isolates the steady-state DTLS 1.2
+// application-record construction and encryption path. It excludes handshake,
+// queues, socket I/O, and peer scheduling so allocation and cipher changes can
+// be screened locally before running the full UDP and Docker benchmarks.
+func BenchmarkAnyConnectRecordProtection(b *testing.B) {
+	for _, cipherSuite := range []struct {
+		name string
+		id   CipherSuiteID
+	}{
+		{name: "AES256-GCM", id: TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
+		{name: "PSK-ChaCha20-Poly1305", id: TLS_PSK_WITH_CHACHA20_POLY1305_SHA256},
+	} {
+		b.Run(cipherSuite.name, func(b *testing.B) {
+			benchmarkAnyConnectRecordProtection(b, cipherSuite.id)
+		})
+	}
+}
+
+func benchmarkAnyConnectRecordProtection(b *testing.B, cipherSuiteID CipherSuiteID) {
+	b.Helper()
+
+	for _, payloadSize := range []int{128, 512, 1200, 1400} {
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			masterSecret := make([]byte, 48)
+			clientRandom := make([]byte, 32)
+			serverRandom := make([]byte, 32)
+			for index := range masterSecret {
+				masterSecret[index] = byte(index*17 + 3)
+			}
+			for index := range clientRandom {
+				clientRandom[index] = byte(index*29 + 5)
+				serverRandom[index] = byte(index*31 + 7)
+			}
+
+			localCipher := cipherSuiteForID(cipherSuiteID, nil)
+			if localCipher == nil {
+				b.Fatalf("unsupported cipher suite %s", cipherSuiteID)
+			}
+			if err := localCipher.Init(masterSecret, clientRandom, serverRandom, true); err != nil {
+				b.Fatal(err)
+			}
+			remoteCipher := cipherSuiteForID(cipherSuiteID, nil)
+			if err := remoteCipher.Init(masterSecret, clientRandom, serverRandom, false); err != nil {
+				b.Fatal(err)
+			}
+
+			client := &Conn{state: State{cipherSuite: localCipher}}
+			client.state.localEpoch.Store(uint16(1))
+			client.state.localSequenceNumber = []uint64{0, 0}
+			packetPayload := newDTLSBenchmarkPacket(payloadSize)
+			packet := &packet{
+				record: &recordlayer.RecordLayer{
+					Header:  recordlayer.Header{Epoch: 1, Version: protocol.Version1_2},
+					Content: &protocol.ApplicationData{Data: packetPayload},
+				},
+				shouldEncrypt: true,
+			}
+
+			var raw []byte
+			var err error
+			b.ReportAllocs()
+			b.SetBytes(int64(payloadSize))
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				setDTLSBenchmarkPacketSequence(packetPayload, uint64(iteration))
+				raw, err = client.processPacket(packet)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+
+			decrypted, err := remoteCipher.Decrypt(recordlayer.Header{}, raw)
+			if err != nil {
+				b.Fatalf("decrypt final benchmark record: %v", err)
+			}
+			var header recordlayer.Header
+			if err = header.Unmarshal(decrypted); err != nil {
+				b.Fatalf("parse final benchmark record: %v", err)
+			}
+			if header.SequenceNumber != uint64(b.N-1) {
+				b.Fatalf("final record sequence = %d, want %d", header.SequenceNumber, b.N-1)
+			}
+			if err = validateDTLSBenchmarkPacket(decrypted[header.Size():], uint64(b.N-1)); err != nil {
+				b.Fatal(err)
+			}
+		})
+	}
+}
+
+func benchmarkAnyConnectP2DTLSUDP(b *testing.B, cipherSuite CipherSuiteID, usePSK bool) {
+	b.Helper()
+
 	for _, payloadSize := range []int{128, 512, 1200, 1400} {
 		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -130,9 +239,24 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 			}
 			defer clientPacketConn.Close()
 
-			certificate, err := selfsign.GenerateSelfSigned()
-			if err != nil {
-				b.Fatal(err)
+			serverConfig := &Config{CipherSuites: []CipherSuiteID{cipherSuite}}
+			clientConfig := &Config{
+				InsecureSkipVerify:  true,
+				CipherSuites:        []CipherSuiteID{cipherSuite},
+				DedicatedPacketConn: true,
+			}
+			if usePSK {
+				psk := []byte("anyconnect-benchmark-psk")
+				pskCallback := func([]byte) ([]byte, error) { return psk, nil }
+				serverConfig.PSK = pskCallback
+				clientConfig.PSK = pskCallback
+				clientConfig.PSKIdentityHint = []byte("anyconnect-benchmark")
+			} else {
+				certificate, generateErr := selfsign.GenerateSelfSigned()
+				if generateErr != nil {
+					b.Fatal(generateErr)
+				}
+				serverConfig.Certificates = []tls.Certificate{certificate}
 			}
 			type serverResult struct {
 				conn *Conn
@@ -140,17 +264,10 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 			}
 			serverReady := make(chan serverResult, 1)
 			go func() {
-				server, serverErr := testServer(ctx, serverPacketConn, clientPacketConn.LocalAddr(), &Config{
-					Certificates: []tls.Certificate{certificate},
-					CipherSuites: []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-				}, false)
+				server, serverErr := testServer(ctx, serverPacketConn, clientPacketConn.LocalAddr(), serverConfig, false)
 				serverReady <- serverResult{conn: server, err: serverErr}
 			}()
-			client, err := testClient(ctx, clientPacketConn, serverPacketConn.LocalAddr(), &Config{
-				InsecureSkipVerify:  true,
-				CipherSuites:        []CipherSuiteID{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-				DedicatedPacketConn: true,
-			}, false)
+			client, err := testClient(ctx, clientPacketConn, serverPacketConn.LocalAddr(), clientConfig, false)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -161,7 +278,7 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 			}
 			server := result.conn
 			defer server.Close()
-			if state, ok := client.ConnectionState(); !ok || state.CipherSuiteID != TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 {
+			if state, ok := client.ConnectionState(); !ok || state.CipherSuiteID != cipherSuite {
 				b.Fatalf("unexpected DTLS benchmark cipher suite: state=%#v available=%v", state, ok)
 			}
 
