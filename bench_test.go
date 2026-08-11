@@ -148,6 +148,106 @@ func BenchmarkAnyConnectRecordProtection(b *testing.B) {
 	}
 }
 
+// BenchmarkAnyConnectRecordUnprotection isolates the steady-state DTLS 1.2
+// application-record decryption path. The returned payload must remain valid
+// after the encrypted input buffer is reused, matching ReadPackets ownership.
+func BenchmarkAnyConnectRecordUnprotection(b *testing.B) {
+	for _, payloadSize := range []int{128, 512, 1200, 1400} {
+		b.Run(fmt.Sprintf("AES256-GCM/%dB", payloadSize), func(b *testing.B) {
+			benchmarkAnyConnectRecordUnprotection(b, payloadSize)
+		})
+	}
+}
+
+type benchmarkApplicationDataDecrypter interface {
+	DecryptApplicationData(header *recordlayer.Header, raw []byte) ([]byte, error)
+}
+
+func benchmarkAnyConnectRecordUnprotection(b *testing.B, payloadSize int) {
+	b.Helper()
+
+	masterSecret := make([]byte, 48)
+	clientRandom := make([]byte, 32)
+	serverRandom := make([]byte, 32)
+	for index := range masterSecret {
+		masterSecret[index] = byte(index*17 + 3)
+	}
+	for index := range clientRandom {
+		clientRandom[index] = byte(index*29 + 5)
+		serverRandom[index] = byte(index*31 + 7)
+	}
+
+	localCipher := cipherSuiteForID(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, nil)
+	if err := localCipher.Init(masterSecret, clientRandom, serverRandom, true); err != nil {
+		b.Fatal(err)
+	}
+	remoteCipher := cipherSuiteForID(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, nil)
+	if err := remoteCipher.Init(masterSecret, clientRandom, serverRandom, false); err != nil {
+		b.Fatal(err)
+	}
+
+	client := &Conn{state: State{cipherSuite: localCipher}, dedicatedPacketConn: true}
+	client.state.localEpoch.Store(uint16(1))
+	client.state.localSequenceNumber = []uint64{0, 0}
+	payload := newDTLSBenchmarkPacket(payloadSize)
+	setDTLSBenchmarkPacketSequence(payload, 0)
+	packet := &packet{
+		record: &recordlayer.RecordLayer{
+			Header:  recordlayer.Header{Epoch: 1, Version: protocol.Version1_2},
+			Content: &protocol.ApplicationData{Data: payload},
+		},
+		shouldEncrypt: true,
+	}
+	raw, err := client.processPacket(packet)
+	if err != nil {
+		b.Fatal(err)
+	}
+	scratch := make([]byte, len(raw))
+
+	var decrypted []byte
+	b.ReportAllocs()
+	b.SetBytes(int64(payloadSize))
+	b.ResetTimer()
+	for range b.N {
+		copy(scratch, raw)
+		decrypted, err = unprotectApplicationDataForBenchmark(remoteCipher, scratch)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+
+	clear(scratch)
+	if err = validateDTLSBenchmarkPacket(decrypted, 0); err != nil {
+		b.Fatalf("decrypted payload aliases reused input: %v", err)
+	}
+}
+
+func unprotectApplicationDataForBenchmark(cipherSuite CipherSuite, raw []byte) ([]byte, error) {
+	var header recordlayer.Header
+	if err := header.Unmarshal(raw); err != nil {
+		return nil, err
+	}
+	if decrypter, loaded := cipherSuite.(benchmarkApplicationDataDecrypter); loaded {
+		return decrypter.DecryptApplicationData(&header, raw)
+	}
+
+	decrypted, err := cipherSuite.Decrypt(recordlayer.Header{}, raw)
+	if err != nil {
+		return nil, err
+	}
+	var record recordlayer.RecordLayer
+	if err = record.Unmarshal(decrypted); err != nil {
+		return nil, err
+	}
+	content, loaded := record.Content.(*protocol.ApplicationData)
+	if !loaded {
+		return nil, fmt.Errorf("unexpected benchmark content type %T", record.Content)
+	}
+
+	return content.Data, nil
+}
+
 func benchmarkAnyConnectRecordProtection(b *testing.B, cipherSuiteID CipherSuiteID) {
 	b.Helper()
 
