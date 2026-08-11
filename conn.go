@@ -1338,27 +1338,29 @@ func (c *Conn) handleIncomingPacket(
 		}
 	}
 
-	isHandshake, isRetransmit, err := c.fragmentBuffer.push(append([]byte{}, buf...))
-	if err != nil {
-		// Decode error must be silently discarded
-		// [RFC6347 Section-4.1.2.7]
-		c.log.Debugf("defragment failed: %s", err)
+	if protocol.ContentType(buf[0]) == protocol.ContentTypeHandshake {
+		isHandshake, isRetransmit, err := c.fragmentBuffer.push(append([]byte{}, buf...))
+		if err != nil {
+			// Decode error must be silently discarded
+			// [RFC6347 Section-4.1.2.7]
+			c.log.Debugf("defragment failed: %s", err)
 
-		return false, false, nil, nil
-	} else if isHandshake {
-		markPacketAsValid()
+			return false, false, nil, nil
+		} else if isHandshake {
+			markPacketAsValid()
 
-		for out, epoch := c.fragmentBuffer.pop(); out != nil; out, epoch = c.fragmentBuffer.pop() {
-			header := &handshake.Header{}
-			if err := header.Unmarshal(out); err != nil {
-				c.log.Debugf("%s: handshake parse failed: %s", srvCliStr(c.state.isClient), err)
+			for out, epoch := c.fragmentBuffer.pop(); out != nil; out, epoch = c.fragmentBuffer.pop() {
+				header := &handshake.Header{}
+				if err := header.Unmarshal(out); err != nil {
+					c.log.Debugf("%s: handshake parse failed: %s", srvCliStr(c.state.isClient), err)
 
-				continue
+					continue
+				}
+				c.handshakeCache.push(out, epoch, header.MessageSequence, header.Type, !c.state.isClient)
 			}
-			c.handshakeCache.push(out, epoch, header.MessageSequence, header.Type, !c.state.isClient)
-		}
 
-		return true, isRetransmit, nil, nil
+			return true, isRetransmit, nil, nil
+		}
 	}
 
 	r := &recordlayer.RecordLayer{}
