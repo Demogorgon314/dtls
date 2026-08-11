@@ -30,7 +30,8 @@ var (
 	//nolint:err113
 	errInvalidMAC = &protocol.TemporaryError{Err: errors.New("invalid mac")}
 	//nolint:err113
-	errFailedToCast = &protocol.FatalError{Err: errors.New("failed to cast")}
+	errFailedToCast            = &protocol.FatalError{Err: errors.New("failed to cast")}
+	errApplicationDataTooLarge = &protocol.InternalError{Err: errors.New("application data exceeds DTLS record length")}
 )
 
 // aead provides a generic API to Encrypt/Decrypt DTLS 1.2 Packets.

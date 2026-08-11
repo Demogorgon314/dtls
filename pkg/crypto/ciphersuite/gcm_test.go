@@ -5,12 +5,50 @@ package ciphersuite
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
+	"math"
 	"testing"
 
 	"github.com/pion/dtls/v3/pkg/protocol"
 	"github.com/pion/dtls/v3/pkg/protocol/recordlayer"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGCMEncryptApplicationData(t *testing.T) {
+	localKey := sha256.Sum256([]byte("local-key"))
+	remoteKey := sha256.Sum256([]byte("remote-key"))
+	localIV := []byte{1, 2, 3, 4}
+	remoteIV := []byte{5, 6, 7, 8}
+	sender, err := NewGCM(localKey[:32], localIV, remoteKey[:32], remoteIV)
+	require.NoError(t, err)
+	receiver, err := NewGCM(remoteKey[:32], remoteIV, localKey[:32], localIV)
+	require.NoError(t, err)
+
+	payload := []byte("anyconnect application packet")
+	original := append([]byte(nil), payload...)
+	header := recordlayer.Header{Version: protocol.Version1_2, Epoch: 3, SequenceNumber: 17}
+	encrypted, err := sender.EncryptApplicationData(&header, payload)
+	require.NoError(t, err)
+	require.Equal(t, original, payload)
+	require.Equal(t, uint16(8+len(payload)+gcmTagLength), header.ContentLen) //nolint:gosec // bounded test payload
+
+	decrypted, err := receiver.Decrypt(recordlayer.Header{}, encrypted)
+	require.NoError(t, err)
+	var decryptedHeader recordlayer.Header
+	require.NoError(t, decryptedHeader.Unmarshal(decrypted))
+	require.Equal(t, header.ContentType, decryptedHeader.ContentType)
+	require.Equal(t, header.Version, decryptedHeader.Version)
+	require.Equal(t, header.Epoch, decryptedHeader.Epoch)
+	require.Equal(t, header.SequenceNumber, decryptedHeader.SequenceNumber)
+	require.Equal(t, header.ContentLen, binary.BigEndian.Uint16(encrypted[header.Size()-2:]))
+	require.Equal(t, payload, decrypted[decryptedHeader.Size():])
+
+	maximumPayload := make([]byte, math.MaxUint16-8-gcmTagLength)
+	_, err = sender.EncryptApplicationData(&header, maximumPayload)
+	require.NoError(t, err)
+	_, err = sender.EncryptApplicationData(&header, append(maximumPayload, 0))
+	require.ErrorIs(t, err, errApplicationDataTooLarge)
+}
 
 func FuzzGCM_RoundTrip(f *testing.F) {
 	f.Add([]byte{}, []byte("x"), uint64(0), uint16(0))

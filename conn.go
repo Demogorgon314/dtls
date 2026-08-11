@@ -60,6 +60,10 @@ type recvHandshakeState struct {
 	isRetransmit bool
 }
 
+type applicationDataEncrypter interface {
+	EncryptApplicationData(header *recordlayer.Header, payload []byte) ([]byte, error)
+}
+
 // Conn represents a DTLS connection.
 type Conn struct {
 	lock           sync.RWMutex      // Internal lock (must not be public)
@@ -905,6 +909,13 @@ func (c *Conn) processPacket(pkt *packet) ([]byte, error) { //nolint:cyclop
 		return nil, errSequenceNumberOverflow
 	}
 	pkt.record.Header.SequenceNumber = seq
+	if c.dedicatedPacketConn && pkt.shouldEncrypt && !pkt.shouldWrapCID {
+		if appData, ok := pkt.record.Content.(*protocol.ApplicationData); ok {
+			if encrypter, ok := c.state.cipherSuite.(applicationDataEncrypter); ok {
+				return encrypter.EncryptApplicationData(&pkt.record.Header, appData.Data)
+			}
+		}
+	}
 
 	var rawPacket []byte
 	if pkt.shouldWrapCID { //nolint:nestif

@@ -176,7 +176,7 @@ func benchmarkAnyConnectRecordProtection(b *testing.B, cipherSuiteID CipherSuite
 				b.Fatal(err)
 			}
 
-			client := &Conn{state: State{cipherSuite: localCipher}}
+			client := &Conn{state: State{cipherSuite: localCipher}, dedicatedPacketConn: true}
 			client.state.localEpoch.Store(uint16(1))
 			client.state.localSequenceNumber = []uint64{0, 0}
 			packetPayload := newDTLSBenchmarkPacket(payloadSize)

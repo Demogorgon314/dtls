@@ -105,6 +105,20 @@ func (c *TLSEcdheEcdsaWithAes128GcmSha256) Encrypt(pkt *recordlayer.RecordLayer,
 	return cipherSuite.Encrypt(pkt, raw)
 }
 
+// EncryptApplicationData encrypts application data without first marshaling a
+// plaintext record.
+func (c *TLSEcdheEcdsaWithAes128GcmSha256) EncryptApplicationData(
+	header *recordlayer.Header,
+	payload []byte,
+) ([]byte, error) {
+	cipherSuite, ok := c.gcm.Load().(*ciphersuite.GCM)
+	if !ok {
+		return nil, fmt.Errorf("%w, unable to encrypt", errCipherSuiteNotInit)
+	}
+
+	return cipherSuite.EncryptApplicationData(header, payload)
+}
+
 // Decrypt decrypts a single TLS RecordLayer.
 func (c *TLSEcdheEcdsaWithAes128GcmSha256) Decrypt(h recordlayer.Header, raw []byte) ([]byte, error) {
 	cipherSuite, ok := c.gcm.Load().(*ciphersuite.GCM)

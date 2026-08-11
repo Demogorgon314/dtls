@@ -32,13 +32,24 @@ const (
 
 // Marshal encodes a TLS RecordLayer Header to binary.
 func (h *Header) Marshal() ([]byte, error) {
+	out := make([]byte, h.Size())
+	if err := h.MarshalInto(out); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// MarshalInto encodes a DTLS record header into out.
+func (h *Header) MarshalInto(out []byte) error {
 	if h.SequenceNumber > MaxSequenceNumber {
-		return nil, errSequenceNumberOverflow
+		return errSequenceNumberOverflow
 	}
 
 	hs := FixedHeaderSize + len(h.ConnectionID)
-
-	out := make([]byte, hs)
+	if len(out) < hs {
+		return errBufferTooSmall
+	}
 	out[0] = byte(h.ContentType)
 	out[1] = h.Version.Major
 	out[2] = h.Version.Minor
@@ -47,7 +58,7 @@ func (h *Header) Marshal() ([]byte, error) {
 	copy(out[11:11+len(h.ConnectionID)], h.ConnectionID)
 	binary.BigEndian.PutUint16(out[hs-2:], h.ContentLen)
 
-	return out, nil
+	return nil
 }
 
 // Unmarshal populates a TLS RecordLayer Header from binary.

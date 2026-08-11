@@ -86,6 +86,24 @@ func TestRecordLayerRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHeaderMarshalInto(t *testing.T) {
+	header := Header{
+		ContentType:    protocol.ContentTypeConnectionID,
+		ContentLen:     321,
+		Version:        protocol.Version1_2,
+		Epoch:          7,
+		SequenceNumber: 0x010203040506,
+		ConnectionID:   []byte{9, 8, 7, 6},
+	}
+	want, err := header.Marshal()
+	require.NoError(t, err)
+
+	got := make([]byte, header.Size())
+	require.NoError(t, header.MarshalInto(got))
+	require.Equal(t, want, got)
+	require.ErrorIs(t, header.MarshalInto(got[:len(got)-1]), errBufferTooSmall)
+}
+
 func FuzzRecordLayer_Unmarshal_No_Panics(f *testing.F) {
 	f.Add([]byte{
 		0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01,
