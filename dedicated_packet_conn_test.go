@@ -20,14 +20,15 @@ import (
 
 type blockingApplicationPacketConn struct {
 	net.PacketConn
-	access        sync.Mutex
-	blocked       bool
-	started       chan struct{}
-	interrupted   chan struct{}
-	startOnce     *sync.Once
-	interruptOnce *sync.Once
-	deadlineErr   error
-	alertWrites   atomic.Int64
+	batchRemoteAddress net.Addr
+	access             sync.Mutex
+	blocked            bool
+	started            chan struct{}
+	interrupted        chan struct{}
+	startOnce          *sync.Once
+	interruptOnce      *sync.Once
+	deadlineErr        error
+	alertWrites        atomic.Int64
 }
 
 func (c *blockingApplicationPacketConn) arm() <-chan struct{} {
@@ -65,6 +66,18 @@ func (c *blockingApplicationPacketConn) WriteTo(packet []byte, remoteAddress net
 	return c.PacketConn.WriteTo(packet, remoteAddress)
 }
 
+func (c *blockingApplicationPacketConn) WritePacketBatchContext(ctx context.Context, packets [][]byte) error {
+	for _, packet := range packets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := c.WriteTo(packet, c.batchRemoteAddress); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *blockingApplicationPacketConn) SetWriteDeadline(deadline time.Time) error {
 	c.access.Lock()
 	deadlineErr := c.deadlineErr
@@ -85,6 +98,20 @@ func (c *blockingApplicationPacketConn) SetWriteDeadline(deadline time.Time) err
 }
 
 func TestDedicatedPacketConnWriteLifecycle(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		batch bool
+	}{
+		{name: "single"},
+		{name: "batch", batch: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			testDedicatedPacketConnWriteLifecycle(t, testCase.batch)
+		})
+	}
+}
+
+func testDedicatedPacketConnWriteLifecycle(t *testing.T, batch bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	serverPacketConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -96,7 +123,10 @@ func TestDedicatedPacketConnWriteLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientPacketConn := &blockingApplicationPacketConn{PacketConn: clientUDP}
+	clientPacketConn := &blockingApplicationPacketConn{
+		PacketConn:         clientUDP,
+		batchRemoteAddress: serverPacketConn.LocalAddr(),
+	}
 	defer clientPacketConn.Close()
 
 	certificate, err := selfsign.GenerateSelfSigned()
@@ -129,6 +159,36 @@ func TestDedicatedPacketConnWriteLifecycle(t *testing.T) {
 	}
 	server := serverResult.conn
 	defer server.Close()
+	payloads := func(value string) [][]byte {
+		result := [][]byte{[]byte(value)}
+		if batch {
+			result = append(result, []byte(value+"-second"))
+		}
+		return result
+	}
+	writePayloads := func(payloads [][]byte) error {
+		if batch {
+			return client.WritePackets(payloads)
+		}
+		for _, payload := range payloads {
+			if _, writeErr := client.Write(payload); writeErr != nil {
+				return writeErr
+			}
+		}
+		return nil
+	}
+	readPayloads := func(payloads [][]byte) {
+		t.Helper()
+		for _, payload := range payloads {
+			reply := make([]byte, len(payload))
+			if _, readErr := server.Read(reply); readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(reply) != string(payload) {
+				t.Fatalf("payload changed: got %q, want %q", reply, payload)
+			}
+		}
+	}
 	initialDeadline := time.Now().Add(time.Minute)
 	if err = client.SetWriteDeadline(initialDeadline); err != nil {
 		t.Fatal(err)
@@ -138,23 +198,16 @@ func TestDedicatedPacketConnWriteLifecycle(t *testing.T) {
 	if err = client.SetWriteDeadline(time.Now()); !errors.Is(err, deadlineErr) {
 		t.Fatalf("failed write deadline returned %v", err)
 	}
-	payload := []byte("after-failed-deadline")
-	if _, err = client.Write(payload); err != nil {
+	testPayloads := payloads("after-failed-deadline")
+	if err = writePayloads(testPayloads); err != nil {
 		t.Fatalf("failed write deadline changed the previous deadline: %v", err)
 	}
-	reply := make([]byte, len(payload))
-	if _, err = server.Read(reply); err != nil {
-		t.Fatal(err)
-	}
-	if string(reply) != string(payload) {
-		t.Fatalf("payload changed after failed write deadline: got %q, want %q", reply, payload)
-	}
+	readPayloads(testPayloads)
 
 	started := clientPacketConn.arm()
 	writeDone := make(chan error, 1)
 	go func() {
-		_, writeErr := client.Write([]byte("deadline"))
-		writeDone <- writeErr
+		writeDone <- writePayloads(payloads("deadline"))
 	}()
 	select {
 	case <-started:
@@ -170,22 +223,15 @@ func TestDedicatedPacketConnWriteLifecycle(t *testing.T) {
 	if err = client.SetWriteDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	payload = []byte("after-deadline")
-	if _, err = client.Write(payload); err != nil {
+	testPayloads = payloads("after-deadline")
+	if err = writePayloads(testPayloads); err != nil {
 		t.Fatal(err)
 	}
-	reply = make([]byte, len(payload))
-	if _, err = server.Read(reply); err != nil {
-		t.Fatal(err)
-	}
-	if string(reply) != string(payload) {
-		t.Fatalf("payload changed after resetting deadline: got %q, want %q", reply, payload)
-	}
+	readPayloads(testPayloads)
 
 	started = clientPacketConn.arm()
 	go func() {
-		_, writeErr := client.Write([]byte("close"))
-		writeDone <- writeErr
+		writeDone <- writePayloads(payloads("close"))
 	}()
 	select {
 	case <-started:

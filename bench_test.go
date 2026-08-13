@@ -24,6 +24,23 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type benchmarkDTLSPacketBatchConn struct {
+	net.PacketConn
+	remoteAddress net.Addr
+}
+
+func (c *benchmarkDTLSPacketBatchConn) WritePacketBatchContext(ctx context.Context, packets [][]byte) error {
+	for _, packet := range packets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := c.WriteTo(packet, c.remoteAddress); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestSimpleReadWrite(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
@@ -131,6 +148,12 @@ func BenchmarkAnyConnectP2DTLSUDP(b *testing.B) {
 			benchmarkAnyConnectP2DTLSUDP(b, cipherSuite.id, cipherSuite.psk)
 		})
 	}
+}
+
+// BenchmarkAnyConnectP2DTLSUDPBatch2 measures the production AnyConnect batch
+// size while preserving one UDP datagram per application payload.
+func BenchmarkAnyConnectP2DTLSUDPBatch2(b *testing.B) {
+	benchmarkAnyConnectP2DTLSUDPBatch(b, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, false, 2)
 }
 
 // BenchmarkAnyConnectRecordProtection isolates the steady-state DTLS 1.2
@@ -324,6 +347,15 @@ func benchmarkAnyConnectRecordProtection(b *testing.B, cipherSuiteID CipherSuite
 }
 
 func benchmarkAnyConnectP2DTLSUDP(b *testing.B, cipherSuite CipherSuiteID, usePSK bool) {
+	benchmarkAnyConnectP2DTLSUDPBatch(b, cipherSuite, usePSK, 1)
+}
+
+func benchmarkAnyConnectP2DTLSUDPBatch(
+	b *testing.B,
+	cipherSuite CipherSuiteID,
+	usePSK bool,
+	batchSize int,
+) {
 	b.Helper()
 
 	for _, payloadSize := range []int{128, 512, 1200, 1400} {
@@ -380,7 +412,14 @@ func benchmarkAnyConnectP2DTLSUDP(b *testing.B, cipherSuite CipherSuiteID, usePS
 				server, serverErr := testServer(ctx, serverPacketConn, clientPacketConn.LocalAddr(), serverConfig, false)
 				serverReady <- serverResult{conn: server, err: serverErr}
 			}()
-			client, err := testClient(ctx, clientPacketConn, serverPacketConn.LocalAddr(), clientConfig, false)
+			var clientDTLSPacketConn net.PacketConn = clientPacketConn
+			if batchSize > 1 {
+				clientDTLSPacketConn = &benchmarkDTLSPacketBatchConn{
+					PacketConn:    clientPacketConn,
+					remoteAddress: serverPacketConn.LocalAddr(),
+				}
+			}
+			client, err := testClient(ctx, clientDTLSPacketConn, serverPacketConn.LocalAddr(), clientConfig, false)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -395,31 +434,42 @@ func benchmarkAnyConnectP2DTLSUDP(b *testing.B, cipherSuite CipherSuiteID, usePS
 				b.Fatalf("unexpected DTLS benchmark cipher suite: state=%#v available=%v", state, ok)
 			}
 
-			packet := newDTLSBenchmarkPacket(payloadSize)
+			packets := make([][]byte, batchSize)
+			for index := range packets {
+				packets[index] = newDTLSBenchmarkPacket(payloadSize)
+			}
 			writeDone := make(chan error, 1)
 			windowRead := make(chan struct{})
 			const maximumInFlightPackets = 64
 			b.ReportAllocs()
-			b.SetBytes(int64(payloadSize))
+			b.SetBytes(int64(payloadSize * batchSize))
 			b.ResetTimer()
 			go func() {
-				for base := 0; base < b.N; base += maximumInFlightPackets {
-					count := min(maximumInFlightPackets, b.N-base)
-					for offset := range count {
-						sequence := base + offset
-						setDTLSBenchmarkPacketSequence(packet, uint64(sequence))
-						if _, writeErr := client.Write(packet); writeErr != nil {
-							writeDone <- fmt.Errorf("write record %d: %w", sequence, writeErr)
-							return
-						}
+				for iteration := 0; iteration < b.N; iteration++ {
+					for offset, packet := range packets {
+						setDTLSBenchmarkPacketSequence(packet, uint64(iteration*batchSize+offset))
 					}
-					<-windowRead
+					var writeErr error
+					if batchSize == 1 {
+						_, writeErr = client.Write(packets[0])
+					} else {
+						writeErr = client.WritePackets(packets)
+					}
+					if writeErr != nil {
+						writeDone <- fmt.Errorf("write batch %d: %w", iteration, writeErr)
+						return
+					}
+					written := (iteration + 1) * batchSize
+					if written%maximumInFlightPackets == 0 || iteration+1 == b.N {
+						<-windowRead
+					}
 				}
 				writeDone <- nil
 			}()
 
 			readBuffer := make([]byte, payloadSize+64)
-			for expected := 0; expected < b.N; expected++ {
+			packetCount := b.N * batchSize
+			for expected := 0; expected < packetCount; expected++ {
 				count, readErr := server.Read(readBuffer)
 				if readErr != nil {
 					cancel()
@@ -429,7 +479,7 @@ func benchmarkAnyConnectP2DTLSUDP(b *testing.B, cipherSuite CipherSuiteID, usePS
 					cancel()
 					b.Fatal(err)
 				}
-				if (expected+1)%maximumInFlightPackets == 0 || expected+1 == b.N {
+				if (expected+1)%maximumInFlightPackets == 0 || expected+1 == packetCount {
 					windowRead <- struct{}{}
 				}
 			}

@@ -626,7 +626,7 @@ func (c *Conn) Write(payload []byte) (int, error) {
 		},
 	}
 	if c.dedicatedPacketConn {
-		return len(payload), c.writeApplicationPackets(packets)
+		return len(payload), c.writeDedicatedApplicationPackets(packets, false)
 	}
 
 	ctx, cancel := c.contextWithClose(c.writeDeadline)
@@ -654,8 +654,6 @@ func (c *Conn) WritePackets(payloads [][]byte) error {
 		return err
 	}
 
-	ctx, cancel := c.contextWithClose(c.writeDeadline)
-	defer cancel()
 	packets := make([]*packet, len(payloads))
 	packetValues := make([]packet, len(payloads))
 	recordValues := make([]recordlayer.RecordLayer, len(payloads))
@@ -673,6 +671,12 @@ func (c *Conn) WritePackets(payloads [][]byte) error {
 		}
 		packets[index] = &packetValues[index]
 	}
+	if c.dedicatedPacketConn {
+		return c.writeDedicatedApplicationPackets(packets, true)
+	}
+
+	ctx, cancel := c.contextWithClose(c.writeDeadline)
+	defer cancel()
 	return c.writePacketBatch(ctx, packets)
 }
 
@@ -733,7 +737,7 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 	return c.writePreparedPackets(ctx, pkts, true)
 }
 
-func (c *Conn) writeApplicationPackets(pkts []*packet) error {
+func (c *Conn) writeDedicatedApplicationPackets(pkts []*packet, preserveDatagrams bool) error {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
 	if c.isConnectionClosed() {
@@ -749,20 +753,35 @@ func (c *Conn) writeApplicationPackets(pkts []*packet) error {
 	if err != nil {
 		return err
 	}
-	for _, rawPacket := range c.compactRawPackets(rawPackets) {
+	if preserveDatagrams && len(rawPackets) > 1 {
+		if batchWriter, loaded := c.nextConn.Conn().(packetBatchWriter); loaded {
+			if err = batchWriter.WritePacketBatchContext(context.Background(), rawPackets); err != nil {
+				return c.translateDedicatedWriteError(err)
+			}
+			return nil
+		}
+	}
+	if !preserveDatagrams {
+		rawPackets = c.compactRawPackets(rawPackets)
+	}
+	for _, rawPacket := range rawPackets {
 		if _, err = c.nextConn.Conn().WriteTo(rawPacket, remoteAddress); err != nil {
-			if c.isConnectionClosed() {
-				return ErrConnClosed
-			}
-			select {
-			case <-c.writeDeadline.Done():
-				return errDeadlineExceeded
-			default:
-			}
-			return netError(err)
+			return c.translateDedicatedWriteError(err)
 		}
 	}
 	return nil
+}
+
+func (c *Conn) translateDedicatedWriteError(err error) error {
+	if c.isConnectionClosed() {
+		return ErrConnClosed
+	}
+	select {
+	case <-c.writeDeadline.Done():
+		return errDeadlineExceeded
+	default:
+	}
+	return netError(err)
 }
 
 func (c *Conn) writePacketBatch(ctx context.Context, pkts []*packet) error {
