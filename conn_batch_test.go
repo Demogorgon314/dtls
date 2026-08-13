@@ -27,11 +27,12 @@ type recordingPacketBatchConn struct {
 
 type recordingPacketBatchReadConn struct {
 	net.PacketConn
-	enabled       atomic.Bool
-	batchReads    atomic.Int32
-	batchPackets  atomic.Int32
-	releases      atomic.Int32
-	batchReleased chan struct{}
+	enabled        atomic.Bool
+	prependInvalid atomic.Bool
+	batchReads     atomic.Int32
+	batchPackets   atomic.Int32
+	releases       atomic.Int32
+	batchReleased  chan struct{}
 }
 
 type trackingApplicationDataBuffer struct {
@@ -76,6 +77,11 @@ func (c *recordingPacketBatchReadConn) ReadPacketBatchContext(ctx context.Contex
 			packets = append(packets, packet)
 		}
 		c.batchReads.Add(1)
+	}
+	if c.prependInvalid.Swap(false) {
+		packets = append([][]byte{{0}}, packets...)
+	}
+	if batched {
 		c.batchPackets.Add(int32(len(packets)))
 	}
 	var releaseOnce sync.Once
@@ -221,12 +227,14 @@ func TestReadUsesPacketBatchReader(t *testing.T) {
 	}()
 
 	serverPacketConn.enabled.Store(true)
+	serverPacketConn.prependInvalid.Store(true)
 	payloads := [][]byte{
 		bytes.Repeat([]byte{1}, 64),
 		bytes.Repeat([]byte{2}, 64),
 		bytes.Repeat([]byte{3}, 64),
 	}
 	require.NoError(t, client.WritePackets(payloads))
+	require.NoError(t, server.SetReadDeadline(time.Now().Add(time.Second)))
 
 	select {
 	case <-serverPacketConn.batchReleased:
@@ -242,7 +250,7 @@ func TestReadUsesPacketBatchReader(t *testing.T) {
 	}
 	require.Equal(t, int32(len(payloads)), applicationBufferReleases.Load())
 	require.Equal(t, int32(1), serverPacketConn.batchReads.Load())
-	require.Equal(t, int32(len(payloads)), serverPacketConn.batchPackets.Load())
+	require.Equal(t, int32(len(payloads)+1), serverPacketConn.batchPackets.Load())
 	require.Equal(t, int32(1), serverPacketConn.releases.Load())
 
 	serverPacketConn.enabled.Store(false)
@@ -268,4 +276,32 @@ func TestReadUsesPacketBatchReader(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return applicationBufferReleases.Load() == applicationBufferAllocations.Load()
 	}, time.Second, time.Millisecond)
+}
+
+func TestQueuedEncryptedPacketOwnsDataAndIsDiscardedOnClose(t *testing.T) {
+	clientTransport, serverTransport := dpipe.Pipe()
+	defer serverTransport.Close()
+	conn, err := createConn(
+		dtlsnet.PacketConnFromConn(clientTransport),
+		clientTransport.RemoteAddr(),
+		&Config{},
+		true,
+		nil,
+	)
+	require.NoError(t, err)
+
+	original := []byte{1, 2, 3, 4}
+	input := append([]byte(nil), original...)
+	require.True(t, conn.enqueueEncryptedPackets(addrPkt{data: input}))
+	clear(input)
+
+	conn.lock.RLock()
+	require.Len(t, conn.encryptedPackets, 1)
+	require.Equal(t, original, conn.encryptedPackets[0].data)
+	conn.lock.RUnlock()
+
+	require.NoError(t, conn.Close())
+	conn.lock.RLock()
+	require.Empty(t, conn.encryptedPackets)
+	conn.lock.RUnlock()
 }

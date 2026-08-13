@@ -1170,6 +1170,12 @@ func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
 		}
 		for _, datagram := range datagrams {
 			if err = c.handleIncomingDatagram(ctx, datagram, remoteAddress); err != nil {
+				if errors.Is(err, recordlayer.ErrInvalidPacketLength) {
+					// Decode errors must be silently discarded without dropping
+					// later datagrams that were returned by the same batch read.
+					// [RFC6347 Section-4.1.2.7]
+					continue
+				}
 				return err
 			}
 		}
@@ -1269,13 +1275,24 @@ func (c *Conn) enqueueEncryptedPackets(packet addrPkt) bool {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if len(c.encryptedPackets) < maxAppDataPacketQueueSize {
+	if !c.isConnectionClosed() && len(c.encryptedPackets) < maxAppDataPacketQueueSize {
+		packet.data = append([]byte(nil), packet.data...)
 		c.encryptedPackets = append(c.encryptedPackets, packet)
 
 		return true
 	}
 
 	return false
+}
+
+func (c *Conn) discardEncryptedPackets() {
+	c.lock.Lock()
+	for index := range c.encryptedPackets {
+		clear(c.encryptedPackets[index].data)
+		c.encryptedPackets[index] = addrPkt{}
+	}
+	c.encryptedPackets = nil
+	c.lock.Unlock()
 }
 
 //nolint:gocognit,gocyclo,cyclop,maintidx
@@ -1730,6 +1747,9 @@ func (c *Conn) close(byUser bool) error {
 		c.closed.Close()
 	}
 	c.closeLock.Unlock()
+	if !isClosed {
+		c.discardEncryptedPackets()
+	}
 	var interruptErr error
 	if !isClosed && c.dedicatedPacketConn {
 		interruptErr = c.interruptDedicatedWrite()
